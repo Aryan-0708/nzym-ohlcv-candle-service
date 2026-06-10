@@ -1,6 +1,6 @@
 # Take-home: OHLCV candle service
 
-**Time box:** ~2–3 hours. We care about judgment and clean execution over completeness. If you run out of time, write down what you'd do next.
+**Time box:** 1 day. We care about judgment and clean execution over completeness. If you run out of time, write down what you'd do next.
 
 ## Context
 
