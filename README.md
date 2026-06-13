@@ -1,43 +1,195 @@
-# Take-home: OHLCV candle service
+# Nzym OHLCV Candle Service
 
-**Time box:** 1 day. We care about judgment and clean execution over completeness. If you run out of time, write down what you'd do next.
+FastAPI service for loading raw market ticks from `ticks.jsonl`, storing them in SQLite, and serving 1-minute and daily OHLCV candles.
 
-## Context
+Aggregation is done in SQL using SQLAlchemy expressions and SQLite window functions. The service does not pull every tick into Python and loop to aggregate candles.
 
-We turn raw market ticks into aggregated OHLCV candles and serve them over an API. This exercise is a miniature of that pipeline — no broker accounts or cloud access required.
+## Features
 
-## What you're given
+- Tick loader for JSON Lines input
+- SQLite storage
+- 1-minute OHLCV candles
+- Daily OHLCV candles
+- Out-of-order tick handling using timestamp ordering
+- Correct conversion from cumulative feed volume to traded candle volume
+- FastAPI endpoints
+- Pytest coverage for aggregation and API behavior
+- Docker support
 
-`ticks.jsonl` — one JSON tick per line:
+## Architecture
 
-```json
-{"instrument_token": 408065, "ts": "2026-06-09T09:15:00.142Z", "last_price": 1523.45, "volume": 1820345}
+```text
+ticks.jsonl -> loader -> SQLite -> SQL aggregation -> service layer -> API
 ```
 
-Two things to note about the data:
+The loader persists raw ticks. API requests flow through thin FastAPI route handlers into a service layer, which validates inputs and calls the SQL aggregation functions.
 
-- `volume` is the **cumulative total for the trading day** (as real feeds report it), not a per-tick amount.
-- Ticks are **not guaranteed to be in timestamp order** — some arrive slightly late, exactly as they would over a real network.
+## Data Model
 
-## What to build
+The `ticks` table stores raw feed ticks:
 
-1. **Loader** — read `ticks.jsonl` and store the ticks. SQLite or Postgres, your call.
-2. **API** — a FastAPI service exposing:
-   - `GET /ohlcv/1min?instrument_token=&from=&to=` → 1-minute candles `{bucket, open, high, low, close, volume}` for the range.
-   - `GET /ohlcv/daily?instrument_token=&from=&to=` → daily candles, same shape with a `date` bucket.
-   - `GET /health`
-   - Candle `volume` is the **traded volume within that bucket** — derive it from the cumulative figure correctly.
-3. **Out-of-order handling** — your candles must be correct regardless of the order ticks arrive in.
-4. **Docker** — `docker compose up` brings up the service (and DB, if you use one). Run instructions in the README.
-5. **Tests** — cover the aggregation logic and at least one failure path (e.g. unknown instrument, invalid date range). No assertions on the status code alone; assert on the actual candle values.
-6. **README** — how to run, how to test, and 3–4 lines on your data model and the one design tradeoff you most want to defend.
+- `id`
+- `instrument_token`
+- `ts`
+- `last_price`
+- `volume`
 
-## Constraints
+Indexes are defined on `instrument_token`, `ts`, and `(instrument_token, ts)` so instrument/range scans used by candle queries are efficient.
 
-- Python 3.11+.
-- Keep config and secrets out of code.
-- Don't pull every row into Python and loop to aggregate — express the aggregation where it belongs.
+## OHLCV Logic
 
-## Submission
+For each bucket:
 
-A public GitHub repo containing the code, the test suite, the Docker setup, and the README. Incremental commits are preferred over a single final dump.
+- `open` = price at the earliest timestamp in the bucket
+- `high` = maximum price in the bucket
+- `low` = minimum price in the bucket
+- `close` = price at the latest timestamp in the bucket
+
+Open and close are selected with SQL `ROW_NUMBER()` window functions ordered by timestamp. Insertion order is never used, so out-of-order ticks still produce correct candles.
+
+## Volume Logic
+
+The feed volume is cumulative for the trading day, not per tick.
+
+Example cumulative volumes inside one bucket:
+
+```text
+1000, 1200, 1500
+```
+
+The candle's traded volume is:
+
+```text
+max(volume) - min(volume) = 1500 - 1000 = 500
+```
+
+## API Endpoints
+
+### `GET /health`
+
+Example:
+
+```bash
+curl http://localhost:8000/health
+```
+
+Response:
+
+```json
+{"status":"ok"}
+```
+
+### `GET /ohlcv/1min?instrument_token=&from=&to=`
+
+Example:
+
+```bash
+curl "http://localhost:8000/ohlcv/1min?instrument_token=408065&from=2026-06-09T09:15:00Z&to=2026-06-09T09:20:00Z"
+```
+
+Response:
+
+```json
+[
+  {
+    "bucket": "2026-06-09T09:15:00Z",
+    "open": 1525.06,
+    "high": 1525.06,
+    "low": 1523.14,
+    "close": 1523.14,
+    "volume": 5743
+  }
+]
+```
+
+### `GET /ohlcv/daily?instrument_token=&from=&to=`
+
+Example:
+
+```bash
+curl "http://localhost:8000/ohlcv/daily?instrument_token=408065&from=2026-06-09T00:00:00Z&to=2026-06-10T00:00:00Z"
+```
+
+Response:
+
+```json
+[
+  {
+    "bucket": "2026-06-09",
+    "open": 1525.06,
+    "high": 1697.92,
+    "low": 1476.3,
+    "close": 1658.23,
+    "volume": 6066655
+  }
+]
+```
+
+## Run Locally
+
+Create and activate a virtual environment:
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+Install dependencies:
+
+```powershell
+pip install -r requirements.txt
+```
+
+Load ticks into SQLite:
+
+```powershell
+python -m app.loader
+```
+
+Start the API:
+
+```powershell
+uvicorn app.main:app --reload
+```
+
+Open the interactive docs:
+
+```text
+http://localhost:8000/docs
+```
+
+The app also initializes SQLite on startup. If the database is empty and `ticks.jsonl` is present, it loads the sample ticks automatically.
+
+## Run Tests
+
+```powershell
+pytest -q
+```
+
+Expected result:
+
+```text
+7 passed
+```
+
+Tests use isolated SQLite databases and deterministic in-test data. They do not depend on `ticks.jsonl`.
+
+## Docker
+
+Run the service from a clean clone:
+
+```bash
+docker compose up
+```
+
+Then open:
+
+```text
+http://localhost:8000/docs
+```
+
+The container creates the SQLite schema on startup and loads `ticks.jsonl` automatically if the database is empty.
+
+## Design Tradeoff
+
+SQLite is used instead of Postgres for this assessment because it keeps setup simple, is sufficient for the provided dataset size, and makes the project reproducible from a clean clone with no extra database container. SQLite also supports the SQL features needed here, including CTEs and window functions, so the core aggregation requirement is still handled in the database.
